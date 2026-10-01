@@ -3,7 +3,8 @@
 并发安全
 ========
 所有会改变编排结果的请求（初始化场景 / 新增组 / 新增封闭 / 登记容量管制 /
-推进分钟）由同一把 asyncio 锁串行化，且每个变更在单个 SQLite 事务内整体提交：
+纠正人群组 / 推进分钟）由同一把 asyncio 锁串行化，且每个变更在单个
+SQLite 事务内整体提交：
 * 重排未出发组时，先删除这些组的全部旧路线再整体写入新路线，
   不会出现只重排了一部分的中间状态；
 * 容量校验基于"已固定组占用 + 本轮已排入组占用"，锁内逐组累加，
@@ -11,11 +12,14 @@
 * 新增封闭若与任一已出发（fixed）组剩余路线相交，直接返回 409，
   数据原样保留、不触发任何重排；
 * 登记容量管制若与同通道已有管制重叠，或新上限使已出发组剩余路线在
-  任一分钟超载，同样整次拒绝（409），不改动任何状态。
+  任一分钟超载，同样整次拒绝（409），不改动任何状态；
+* 纠正清单中任一项无效（组不存在 / 最终字段不满足组校验 / 起点非场馆
+  节点）或目标组已出发（含并发时间推进所致），整批拒绝（422/409），
+  状态与修订历史不变。
 
 修订历史
 ========
-上述五类变更成功提交时，在同一事务内追加一条修订记录：全局递增修订号、
+上述六类变更成功提交时，在同一事务内追加一条修订记录：全局递增修订号、
 触发操作、提交后的当前分钟、提交前后完整编排快照。被拒绝的请求（409/422）
 不产生修订。修订记录不随场景重置或服务重启丢失，历史快照按落库内容
 原样返回，不按当前场景重算。
@@ -25,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import os
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 import aiosqlite
 from fastapi import FastAPI, HTTPException, Request
@@ -35,9 +40,9 @@ from . import db
 from .planner import effective_capacity, plan_group
 from .schemas import (CapacityControlIn, CapacityControlListOut,
                       CapacityControlOut, ClosureIn, ConflictOut,
-                      GroupChangeOut, GroupIn, GroupPlanOut, PlanResponse,
-                      RevisionDetailOut, RevisionListOut, RevisionSummaryOut,
-                      ScenarioIn, StepOut)
+                      CorrectionIn, GroupChangeOut, GroupIn, GroupPlanOut,
+                      PlanResponse, RevisionDetailOut, RevisionListOut,
+                      RevisionSummaryOut, ScenarioIn, StepOut)
 from .seed import SEED_SCENARIO
 
 DB_PATH = os.getenv("EVAC_DB_PATH", "/data/evacuation.db")
@@ -69,9 +74,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="场馆疏散通道编排服务",
-    version="1.1.0",
+    version="1.2.0",
     description="按优先级逐组编排截止前最早到达的疏散路线，"
-                "支持封闭时段、容量管制时段、每分钟容量约束与增量重排。",
+                "支持封闭时段、容量管制时段、人群组纠正、每分钟容量约束"
+                "与增量重排。",
     lifespan=lifespan,
 )
 
@@ -352,6 +358,115 @@ async def add_groups(groups: list[GroupIn], request: Request):
                 conn, "groups",
                 {"groups": [g.model_dump() for g in groups]},
                 _plan_dump(before), _plan_dump(after))
+        return after
+
+
+# 纠正可修改的组字段（未指定时沿用原值）
+_CORRECTABLE_FIELDS = ("size", "origin", "earliest_departure",
+                       "priority", "deadline")
+
+
+@app.post("/corrections", tags=["变更"], response_model=PlanResponse)
+async def correct_groups(
+        corrections: Annotated[list[CorrectionIn],
+                               Field(min_length=1,
+                                     description="非空的人群组纠正清单")],
+        request: Request):
+    """批量纠正已有人群组的字段（现场负责人纠正清单）。
+
+    每项指定一个已有组编号及至少一项新值（人数/起点/最早出发分钟/优先级/
+    截止分钟），未指定字段沿用原值；同批组编号不得重复。仅未出发
+    （scheduled）或此前编排失败（failed）的组可纠正；任一目标组已出发
+    （fixed，含并发时间推进所致）则整批拒绝（409），状态与修订历史不变。
+    纠正后的最终字段须满足与新增组相同的校验（截止分钟不早于最早出发
+    分钟等），起点须为场馆节点；任一项无效（422）同样整批拒绝。
+
+    成功时整批按最终值一次生效，随后按现有优先级、封闭、容量管制与
+    逐分钟容量规则整体重排未出发组（已出发组路线与占用保持固定），
+    返回完整编排，并在同一事务内记录一条 corrections 修订
+    （含每项纠正前后字段与编排差异）。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        seen: set[int] = set()
+        for c in corrections:
+            if c.group_id in seen:
+                raise HTTPException(
+                    422, f"同批纠正清单中组编号 {c.group_id} 重复")
+            seen.add(c.group_id)
+
+        placeholders = ",".join("?" for _ in corrections)
+        async with conn.execute(
+                f"""SELECT id, size, origin, earliest_departure, priority,
+                           deadline, status
+                    FROM groups WHERE id IN ({placeholders})""",
+                [c.group_id for c in corrections]) as cur:
+            rows = {row[0]: row for row in await cur.fetchall()}
+
+        async with conn.execute(
+                "SELECT src FROM edges UNION SELECT dst FROM edges") as cur:
+            known_nodes = {row[0] for row in await cur.fetchall()}
+        async with conn.execute("SELECT node_id FROM exits") as cur:
+            known_nodes |= {row[0] for row in await cur.fetchall()}
+
+        merged = []   # (纠正项, 纠正前字段, 最终字段)
+        departed = []
+        for c in corrections:
+            row = rows.get(c.group_id)
+            if row is None:
+                raise HTTPException(422, f"人群组 {c.group_id} 不存在")
+            if row[6] == "fixed":
+                departed.append(c.group_id)
+                continue
+            before_fields = dict(zip(_CORRECTABLE_FIELDS, row[1:6]))
+            final = {f: (getattr(c, f) if getattr(c, f) is not None
+                         else before_fields[f])
+                     for f in _CORRECTABLE_FIELDS}
+            merged.append((c, before_fields, final))
+
+        if departed:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "GROUP_ALREADY_DEPARTED",
+                    "message": "目标组已出发，不可纠正（可能因并发时间推进），"
+                               "整批拒绝",
+                    "conflicts": [{"group_id": gid, "status": "fixed"}
+                                  for gid in departed],
+                })
+
+        for c, _before_fields, final in merged:
+            if final["deadline"] < final["earliest_departure"]:
+                raise HTTPException(
+                    422, f"组 {c.group_id} 纠正后的规划截止分钟 "
+                         f"{final['deadline']} 早于最早出发分钟 "
+                         f"{final['earliest_departure']}")
+            if final["origin"] not in known_nodes:
+                raise HTTPException(
+                    422, f"组 {c.group_id} 的起点 {final['origin']} "
+                         f"不是场馆节点")
+
+        before = await _build_plan_response(conn)
+        async with db.transaction(conn):
+            for c, _before_fields, final in merged:
+                await conn.execute(
+                    """UPDATE groups SET size=?, origin=?,
+                       earliest_departure=?, priority=?, deadline=?
+                       WHERE id=?""",
+                    (final["size"], final["origin"],
+                     final["earliest_departure"], final["priority"],
+                     final["deadline"], c.group_id))
+            await _replan_pending(conn, in_transaction=True)
+            after = await _build_plan_response(conn)
+            detail = {"corrections": [
+                {"group_id": c.group_id,
+                 "fields": [f for f in _CORRECTABLE_FIELDS
+                            if getattr(c, f) is not None],
+                 "before": before_fields,
+                 "after": final}
+                for c, before_fields, final in merged]}
+            await db.insert_revision(conn, "corrections", detail,
+                                     _plan_dump(before), _plan_dump(after))
         return after
 
 

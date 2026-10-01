@@ -89,15 +89,35 @@ curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/capacity-contr
   -d '{"edge_id": 1, "start_minute": 12, "end_minute": 16, "capacity": 20}'
 python3 -m json.tool /tmp/resp.json || true
 
-say "15) 列出修订历史（每次成功变更一条，被拒绝的请求不产生）"
+say "15) 批量纠正未出发组字段（组1：优先级 10->6；组7：人数 25->20、截止 40->38），整批生效并重排"
+curl -s -X POST "$BASE/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '[
+    {"group_id": 1, "priority": 6},
+    {"group_id": 7, "size": 20, "deadline": 38}
+  ]' | python3 -m json.tool
+
+say "16) 纠正已出发的组3（t=0 出发已固定，预期 HTTP 409 整批拒绝）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '[{"group_id": 3, "size": 8}]'
+python3 -m json.tool /tmp/resp.json || true
+
+say "17) 非法纠正清单（同批组编号重复，预期 HTTP 422 整批拒绝）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '[{"group_id": 1, "size": 28}, {"group_id": 1, "priority": 3}]'
+python3 -m json.tool /tmp/resp.json || true
+
+say "18) 列出修订历史（每次成功变更一条，被拒绝的请求不产生）"
 curl -s "$BASE/revisions" | python3 -m json.tool
 
-say "16) 按修订号查询：当时编排快照 + 各组前后差异（取最新一条，应为 capacity-controls）"
+say "19) 按修订号查询：当时编排快照 + 各组前后差异（取最新一条，应为 corrections）"
 LATEST=$(curl -s "$BASE/revisions" | python3 -c \
   'import json,sys; print(json.load(sys.stdin)["revisions"][-1]["rev"])')
 curl -s "$BASE/revisions/$LATEST" | python3 -m json.tool
 
-say "17) 查询未知修订号（预期 HTTP 404）"
+say "20) 查询未知修订号（预期 HTTP 404）"
 curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' "$BASE/revisions/999999"
 python3 -m json.tool /tmp/resp.json || true
 

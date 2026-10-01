@@ -125,6 +125,26 @@ if __name__ == "__main__":
                             "end_minute": 16, "capacity": 20})
     show("与已有管制重叠的时段（预期 409）", status, payload)
 
+    # ---- 人群组纠正清单 ----
+    # 组 3 已在 t=0 出发（fixed）：不可纠正，整批拒绝
+    status, payload = call("POST", "/corrections",
+                           [{"group_id": 3, "size": 8}])
+    show("纠正已出发的组 3（预期 409）", status, payload)
+
+    # 批量纠正未出发/失败组：组 1 调整优先级；组 9（此前编排失败）
+    # 缩小人数并放宽截止。整批一次生效，随后整体重排未出发组
+    status, plan = call("POST", "/corrections", [
+        {"group_id": 1, "priority": 6},
+        {"group_id": 9, "size": 30, "deadline": 30}])
+    show("批量纠正未出发/失败组字段（整批生效并重排）", status, plan)
+    summarize(plan)
+
+    # 同批组编号重复 -> 422，整批拒绝
+    status, payload = call("POST", "/corrections",
+                           [{"group_id": 1, "size": 28},
+                            {"group_id": 1, "priority": 3}])
+    show("同批组编号重复的纠正清单（预期 422）", status, payload)
+
     # ---- 修订历史：追溯每次编排变更 ----
     status, payload = call("GET", "/revisions")
     show("修订列表（每次成功变更一条，拒绝不产生）", status, payload)

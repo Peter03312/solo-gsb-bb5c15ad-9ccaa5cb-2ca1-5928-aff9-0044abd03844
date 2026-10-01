@@ -67,13 +67,13 @@ CREATE TABLE IF NOT EXISTS route_steps (
 );
 
 -- 修订历史：每次成功的编排变更（场景重置/新增组/登记封闭/登记容量管制/
--- 推进时间）与编排变更在同一事务内写入；快照为提交时刻的完整编排 JSON，
--- 落库后不再改动、查询时不按当前场景重算。场景重置（reset_db）
--- 与服务重启均不影响本表。
+-- 纠正人群组/推进时间）与编排变更在同一事务内写入；快照为提交时刻的
+-- 完整编排 JSON，落库后不再改动、查询时不按当前场景重算。场景重置
+-- （reset_db）与服务重启均不影响本表。
 CREATE TABLE IF NOT EXISTS revisions (
     rev         INTEGER PRIMARY KEY,  -- 全局递增修订号（按实际提交顺序）
     operation   TEXT NOT NULL,        -- scenario | groups | closures |
-                                      -- capacity-controls | tick
+                                      -- capacity-controls | corrections | tick
     detail      TEXT NOT NULL,        -- JSON：触发操作的参数摘要
     minute      INTEGER NOT NULL,     -- 该修订提交后的当前分钟
     plan_before TEXT NOT NULL,        -- JSON：提交前完整编排（PlanResponse）
