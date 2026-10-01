@@ -81,6 +81,34 @@ class ScenarioIn(BaseModel):
     groups: list[GroupIn] = Field(default_factory=list)
 
 
+class GroupCorrectionIn(BaseModel):
+    """单条人群组纠正：指定已有组编号及至少一个待纠正字段。
+
+    未指定的字段沿用原值；合并后的最终字段须通过 GroupIn 的全部校验
+    （在服务层按合并结果复核，含"截止不早于最早出发"的跨字段约束）。
+    """
+    group_id: int = Field(..., ge=1, description="要纠正的已有人群组编号")
+    size: Optional[int] = Field(None, gt=0, description="新人数（正整数）")
+    origin: Optional[int] = Field(None, ge=0,
+                                  description="新起点节点编号（须为场馆节点）")
+    earliest_departure: Optional[int] = Field(None, ge=0,
+                                              description="新最早出发分钟")
+    priority: Optional[int] = Field(None, ge=0,
+                                    description="新优先级，数值越大越优先")
+    deadline: Optional[int] = Field(None, ge=0,
+                                    description="新规划截止分钟（到达须不晚于此）")
+
+    @model_validator(mode="after")
+    def _at_least_one_field(self):
+        if all(v is None for v in (self.size, self.origin,
+                                   self.earliest_departure, self.priority,
+                                   self.deadline)):
+            raise ValueError(
+                "每项纠正至少指定一个字段：size/origin/earliest_departure/"
+                "priority/deadline")
+        return self
+
+
 class StepOut(BaseModel):
     edge_id: int
     from_node: int
@@ -135,8 +163,8 @@ class RevisionSummaryOut(BaseModel):
     rev: int = Field(description="全局递增修订号（按实际提交顺序编号）")
     operation: str = Field(
         description="触发操作：scenario=场景重置 | groups=新增人群组 | "
-                    "closures=登记封闭 | capacity-controls=登记容量管制 | "
-                    "tick=时间推进")
+                    "group-corrections=纠正人群组 | closures=登记封闭 | "
+                    "capacity-controls=登记容量管制 | tick=时间推进")
     minute: int = Field(description="该修订提交后的当前分钟")
     detail: dict = Field(default_factory=dict, description="触发操作的参数摘要")
 
